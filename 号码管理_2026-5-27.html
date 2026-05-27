@@ -171,13 +171,357 @@
 </div>
 
 <script>
-// ========== 需求模块 2：手动保存与防抖机制 ==========
+// ========== 需求模块 3：Supabase JSONB 存储与防覆盖（乐观锁）==========
 
-// 保存状态控制变量
+// 配置与初始化
+const SupabaseConfig = {
+  url: process.env.SUPABASE_URL || window.SUPABASE_URL || '',
+  anonKey: process.env.SUPABASE_ANON_KEY || window.SUPABASE_ANON_KEY || '',
+  tableName: 'phone_numbers_state',
+  userId: localStorage.getItem('userId') || 'anonymous'
+};
+
+function validateSupabaseConfig() {
+  if (!SupabaseConfig.url || !SupabaseConfig.anonKey) {
+    console.warn('⚠️ Supabase 配置未完成，功能降级为本地存储');
+    return false;
+  }
+  console.log('✅ Supabase 配置已加载');
+  return true;
+}
+
+// 数据结构：AppStatePackage
+class AppStatePackage {
+  constructor() {
+    this.id = SupabaseConfig.userId;
+    this.phoneNumbers = [];
+    this.groups = {};
+    this.lastLocalSaveTime = null;
+    this.createdAt = new Date().toISOString();
+    this.updatedAt = new Date().toISOString();
+  }
+
+  collectFromUI() {
+    const tableBody = document.getElementById('tableBody');
+    this.phoneNumbers = [];
+    
+    if (tableBody) {
+      const rows = tableBody.querySelectorAll('tr');
+      rows.forEach((row) => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length > 1 && cells[2]?.textContent) {
+          this.phoneNumbers.push({
+            number: cells[2].textContent.trim(),
+            remark: cells[3]?.textContent.trim() || '',
+            group: cells[4]?.textContent.trim() || '未分组'
+          });
+        }
+      });
+    }
+
+    const groupTabs = document.getElementById('groupTabs');
+    if (groupTabs) {
+      const groupMatches = groupTabs.textContent.match(/(\S+)\s*\((\d+)\)/g);
+      if (groupMatches) {
+        this.groups = {};
+        groupMatches.forEach((match) => {
+          const parsed = match.match(/(\S+)\s*\((\d+)\)/);
+          if (parsed) {
+            this.groups[parsed[1]] = parseInt(parsed[2]);
+          }
+        });
+      }
+    }
+
+    this.lastLocalSaveTime = new Date().toISOString();
+    this.updatedAt = this.lastLocalSaveTime;
+
+    return this;
+  }
+
+  toJSON() {
+    return {
+      id: this.id,
+      user_data: {
+        phoneNumbers: this.phoneNumbers,
+        groups: this.groups,
+        lastLocalSaveTime: this.lastLocalSaveTime,
+        statistics: {
+          totalCount: this.phoneNumbers.length,
+          validCount: this.phoneNumbers.filter(p => p.number).length,
+          duplicateCount: this.calculateDuplicates()
+        }
+      },
+      created_at: this.createdAt,
+      updated_at: this.updatedAt
+    };
+  }
+
+  calculateDuplicates() {
+    const numbers = this.phoneNumbers.map(p => p.number);
+    const counted = new Set();
+    let duplicateCount = 0;
+
+    numbers.forEach((num) => {
+      if (counted.has(num)) {
+        duplicateCount++;
+      } else {
+        counted.add(num);
+      }
+    });
+
+    return duplicateCount;
+  }
+}
+
+// REST API 适配器
+class SupabaseRESTAdapter {
+  constructor(table, operation, fields, data) {
+    this.table = table;
+    this.operation = operation;
+    this.fields = fields;
+    this.data = data;
+    this.url = `${SupabaseConfig.url}/rest/v1/${table}`;
+    this.headers = {
+      'apikey': SupabaseConfig.anonKey,
+      'Authorization': `Bearer ${SupabaseConfig.anonKey}`,
+      'Content-Type': 'application/json',
+      'Prefer': 'return=representation'
+    };
+  }
+
+  async eq(column, value) {
+    try {
+      const query = `${this.url}?${column}=eq.${encodeURIComponent(value)}&select=${this.fields || '*'}`;
+      const response = await fetch(query, { method: 'GET', headers: this.headers });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+      const data = await response.json();
+      return { data, error: null };
+    } catch (error) {
+      console.error('❌ SELECT 查询失败:', error);
+      return { data: null, error };
+    }
+  }
+
+  async execute() {
+    try {
+      const response = await fetch(this.url, {
+        method: 'POST',
+        headers: { ...this.headers, 'Prefer': 'resolution=merge-duplicates' },
+        body: JSON.stringify(this.data)
+      });
+
+      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+
+      const data = await response.json();
+      return { data, error: null };
+    } catch (error) {
+      console.error('❌ UPSERT 操作失败:', error);
+      return { data: null, error };
+    }
+  }
+}
+
+// 防覆盖机制（乐观锁）
+let cloudLastUpdateTime = null;
 let isSaving = false;
 let saveDebounceTimeout = null;
 
-// ========== 取消自动保存，仅绑定保存按钮 ==========
+async function fetchCloudTimestamp() {
+  if (!validateSupabaseConfig()) return null;
+
+  try {
+    const adapter = new SupabaseRESTAdapter(SupabaseConfig.tableName, 'SELECT', 'updated_at');
+    const { data, error } = await adapter.eq('id', SupabaseConfig.userId);
+
+    if (error) {
+      console.error('❌ 无法从云端拉取时间戳:', error);
+      return null;
+    }
+
+    if (data && data.length > 0) {
+      cloudLastUpdateTime = data[0].updated_at;
+      console.log('✅ 云端时间戳已同步:', cloudLastUpdateTime);
+      return cloudLastUpdateTime;
+    }
+
+    console.log('ℹ️ 首次保存，云端无历史数据');
+    return null;
+  } catch (error) {
+    console.error('❌ 拉取时间戳异常:', error);
+    return null;
+  }
+}
+
+async function validateSavePermission(localSaveTime) {
+  if (cloudLastUpdateTime === null) {
+    await fetchCloudTimestamp();
+  }
+
+  if (cloudLastUpdateTime === null) {
+    console.log('✅ 首次保存，无冲突');
+    return 'safe';
+  }
+
+  const localTime = new Date(localSaveTime).getTime();
+  const cloudTime = new Date(cloudLastUpdateTime).getTime();
+
+  if (cloudTime > localTime) {
+    console.warn('⚠️ 冲突检测：云端时间更新，有其他设备在修改');
+    return 'conflict';
+  }
+
+  console.log('✅ 冲突检测通过：本地最新，可以保存');
+  return 'safe';
+}
+
+async function performUpsert() {
+  try {
+    console.log('🔄 开始 UPSERT 操作...');
+
+    const appState = new AppStatePackage();
+    appState.collectFromUI();
+    const payload = appState.toJSON();
+
+    const permission = await validateSavePermission(appState.lastLocalSaveTime);
+    
+    if (permission === 'conflict') {
+      const errorMsg = '数据已在其他设备更新，请刷新';
+      console.error('❌ ' + errorMsg);
+      showConflictDialog(errorMsg);
+      return {
+        success: false,
+        error: 'CONFLICT',
+        message: errorMsg
+      };
+    }
+
+    if (!validateSupabaseConfig()) {
+      console.warn('⚠️ Supabase 未初始化，降级为本地存储');
+      saveToLocalStorage(payload);
+      return {
+        success: true,
+        message: '已保存到本地存储（云端暂不可用）'
+      };
+    }
+
+    const adapter = new SupabaseRESTAdapter(SupabaseConfig.tableName, 'UPSERT', null, payload);
+    const { data, error } = await adapter.execute();
+
+    if (error) throw error;
+
+    cloudLastUpdateTime = payload.updated_at;
+
+    console.log('✅ UPSERT 成功，云端数据已更新');
+    return {
+      success: true,
+      data: data,
+      message: '数据已同步到云端',
+      cloudUpdateTime: cloudLastUpdateTime
+    };
+  } catch (error) {
+    console.error('❌ UPSERT 失败:', error);
+    return {
+      success: false,
+      error: error.message,
+      message: '保存失败，请重试'
+    };
+  }
+}
+
+async function fetchDataFromCloud() {
+  try {
+    console.log('🔄 从云端拉取数据...');
+
+    if (!validateSupabaseConfig()) {
+      console.warn('⚠️ Supabase 未初始化，使用本地存储');
+      return getFromLocalStorage();
+    }
+
+    const adapter = new SupabaseRESTAdapter(SupabaseConfig.tableName, 'SELECT', '*');
+    const { data, error } = await adapter.eq('id', SupabaseConfig.userId);
+
+    if (error) throw error;
+
+    if (data && data.length > 0) {
+      const record = data[0];
+      cloudLastUpdateTime = record.updated_at;
+      
+      console.log('✅ 云端数据已拉取');
+      return {
+        success: true,
+        data: record.user_data,
+        timestamp: record.updated_at
+      };
+    }
+
+    console.log('ℹ️ 云端暂无数据');
+    return { success: false, message: '云端无历史数据' };
+  } catch (error) {
+    console.error('❌ 读取云端数据失败:', error);
+    return { success: false, error: error.message };
+  }
+}
+
+function saveToLocalStorage(payload) {
+  try {
+    localStorage.setItem(`phoneNumbers_${SupabaseConfig.userId}`, JSON.stringify(payload));
+    console.log('✅ 已保存到本地存储');
+  } catch (error) {
+    console.error('❌ 本地存储失败:', error);
+  }
+}
+
+function getFromLocalStorage() {
+  try {
+    const data = localStorage.getItem(`phoneNumbers_${SupabaseConfig.userId}`);
+    if (data) return { success: true, data: JSON.parse(data) };
+    return { success: false };
+  } catch (error) {
+    console.error('❌ 本地存储读取失败:', error);
+    return { success: false };
+  }
+}
+
+function showConflictDialog(message) {
+  const dialog = document.createElement('div');
+  dialog.style.cssText = `
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: white;
+    border-radius: 8px;
+    padding: 24px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    z-index: 10000;
+    max-width: 400px;
+  `;
+
+  dialog.innerHTML = `
+    <h3 style="color: #d32f2f; margin-bottom: 12px;">⚠️ 数据冲突</h3>
+    <p style="color: #666; margin-bottom: 20px;">${message}</p>
+    <button id="refreshBtn" style="
+      padding: 10px 20px;
+      background: #1976d2;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 14px;
+    ">刷新页面</button>
+  `;
+
+  document.body.appendChild(dialog);
+  document.getElementById('refreshBtn').addEventListener('click', () => {
+    location.reload();
+  });
+}
+
+// ========== 需求模块 2：手动保存与防抖机制 ==========
+
 function setupSaveButton() {
   const saveBtn = document.getElementById('saveBtn');
   
@@ -190,117 +534,50 @@ function setupSaveButton() {
   console.log('✅ 保存按钮已绑定');
 }
 
-// ========== 保存按钮点击处理器（含防抖机制）==========
 async function handleSaveClick(e) {
   e.preventDefault();
   
   const saveBtn = document.getElementById('saveBtn');
   
-  // 防抖：正在保存中，禁止再次点击
   if (isSaving) {
     console.warn('⚠️ 保存中，请勿重复点击');
     return;
   }
 
-  // 标记为保存中
   isSaving = true;
   const originalText = saveBtn.textContent;
   
-  // 按钮进入 Loading 状态
   saveBtn.disabled = true;
   saveBtn.textContent = '💾 保存中...';
   saveBtn.style.opacity = '0.6';
 
   try {
-    // 调用保存逻辑
-    const result = await saveData();
+    // 调用 Supabase UPSERT（需求模块 3）
+    const result = await performUpsert();
     
     if (result.success) {
-      // 保存成功：显示成功提示
       saveBtn.textContent = '✓ 已保存';
       saveBtn.style.opacity = '1';
-      
+      updateLastSaveTime();
       console.log('✅ 数据保存成功');
     } else {
       throw new Error(result.message || '保存失败');
     }
   } catch (error) {
     console.error('❌ 保存失败:', error.message);
-    
-    // 保存失败：显示错误提示
     saveBtn.textContent = '✗ 保存失败';
     saveBtn.style.opacity = '1';
     alert(`保存失败：${error.message}`);
   } finally {
-    // 3秒后恢复按钮状态（防止重复提交）
     clearTimeout(saveDebounceTimeout);
     saveDebounceTimeout = setTimeout(() => {
       saveBtn.textContent = originalText;
       saveBtn.style.opacity = '1';
       saveBtn.disabled = false;
       isSaving = false;
-      
       console.log('✅ 按钮已恢复，可再次保存');
     }, 3000);
   }
-}
-
-// ========== 实际保存函数 ==========
-async function saveData() {
-  // 获取当前应用状态
-  const state = {
-    timestamp: new Date().toISOString(),
-    data: window.appState || {},
-    tableData: getTableData()
-  };
-
-  try {
-    // 实际环境中将数据发送到 Supabase
-    // const response = await fetch('/api/save', {
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify(state)
-    // });
-    // return await response.json();
-
-    // 当前模拟保存（延迟500ms模拟网络请求）
-    return await new Promise((resolve) => {
-      setTimeout(() => {
-        console.log('📊 已保存的数据:', state);
-        resolve({ 
-          success: true, 
-          message: '数据保存成功',
-          savedAt: new Date().toISOString()
-        });
-      }, 500);
-    });
-  } catch (error) {
-    console.error('保存异常:', error);
-    return {
-      success: false,
-      message: error.message || '保存失败，请重试'
-    };
-  }
-}
-
-// ========== 获取表格数据 ==========
-function getTableData() {
-  const tableBody = document.getElementById('tableBody');
-  const rows = tableBody.querySelectorAll('tr');
-  const data = [];
-
-  rows.forEach((row) => {
-    const cells = row.querySelectorAll('td');
-    if (cells.length > 1) {
-      data.push({
-        号码: cells[2]?.textContent || '',
-        备注: cells[3]?.textContent || '',
-        分组: cells[4]?.textContent || ''
-      });
-    }
-  });
-
-  return data;
 }
 
 // ========== 时间戳显示与实时更新 ==========
@@ -417,19 +694,32 @@ document.addEventListener('DOMContentLoaded', () => {
   setupKeyboardShortcuts();
   setupUIEvents();
   
-  // 初始化时间戳
   updateLastSaveTime();
-  
-  // 每秒更新一次时间戳
   setInterval(updateLastSaveTime, 1000);
   
-  console.log('✅ 号码管理系统已初始化（需求模块 2 已集成）');
+  console.log('✅ 号码管理系统已初始化');
   console.log('📋 功能清单：');
-  console.log('   ✓ 手动保存（仅保存按钮绑定）');
-  console.log('   ✓ 防抖机制（3秒内禁止重复点击）');
-  console.log('   ✓ Loading 状态（禁用按钮，显示"保存中..."）');
-  console.log('   ✓ 时间戳实时更新');
+  console.log('   ✓ 模块 1：认证拦截 + 时间戳显示');
+  console.log('   ✓ 模块 2：手动保存 + 3秒防抖');
+  console.log('   ✓ 模块 3：Supabase JSONB + 乐观锁防覆盖');
 });
+
+// 导出供全局使用
+window.SupabaseModule = {
+  AppStatePackage,
+  fetchCloudTimestamp,
+  validateSavePermission,
+  performUpsert,
+  fetchDataFromCloud,
+  saveToLocalStorage,
+  getFromLocalStorage,
+  showConflictDialog,
+  getConfig: () => SupabaseConfig,
+  setUserId: (userId) => {
+    SupabaseConfig.userId = userId;
+    localStorage.setItem('userId', userId);
+  }
+};
 </script>
 
 </body>
